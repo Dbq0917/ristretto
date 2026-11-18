@@ -107,10 +107,17 @@ func (m *expirationMap[_]) del(key uint64, expiration time.Time) {
 	delete(m.buckets[bucketNum], key)
 }
 
-// cleanup removes all the items in the bucket that was just completed. It deletes
-// those items from the store, and calls the onEvict function on those items.
-// This function is meant to be called periodically.
-func (m *expirationMap[V]) cleanup(store store[V], policy *defaultPolicy[V], onEvict func(item *Item[V])) int {
+// cleanup removes all the items in the bucket that was just completed. It
+// deletes those items from the store, and calls the onEvict function on those
+// items. This function is meant to be called periodically.
+//
+// The store is the single source of truth for whether an entry is really gone:
+// a key whose expiration was refreshed concurrently moves to a different bucket
+// and its conditional delete fails, so cleanup neither removes it nor touches
+// its policy accounting. Policy cost is reclaimed only after the store confirms
+// the deletion, which keeps the two former ledgers permanently in sync without
+// a global write lock.
+func (m *expirationMap[V]) cleanup(store store[V], policy policyEvictor[V], onEvict func(item *Item[V])) int {
 	if m == nil {
 		return 0
 	}
@@ -133,23 +140,25 @@ func (m *expirationMap[V]) cleanup(store store[V], policy *defaultPolicy[V], onE
 
 	for _, keys := range buckets {
 		for key, conflict := range keys {
-			expr := store.Expiration(key)
-			// Sanity check. Verify that the store agrees that this key is expired.
-			if expr.After(now) {
+			// Look up the expiration the store currently holds for the key.
+			// The conditional delete below re-checks it under the shard lock,
+			// so a refresh landing here makes the delete a no-op.
+			expiration := store.Expiration(key)
+			if expiration.After(now) {
+				continue
+			}
+			item, removed := store.DelExpired(key, conflict, expiration)
+			if !removed {
+				// The entry was refreshed or deleted concurrently; its
+				// accounting is owned by that writer, leave it untouched.
 				continue
 			}
 
-			cost := policy.Cost(key)
-			policy.Del(key)
-			_, value := store.Del(key, conflict)
-
+			if cost := policy.RemoveAccounting(key); cost >= 0 {
+				item.Cost = cost
+			}
 			if onEvict != nil {
-				onEvict(&Item[V]{Key: key,
-					Conflict:   conflict,
-					Value:      value,
-					Cost:       cost,
-					Expiration: expr,
-				})
+				onEvict(item)
 			}
 		}
 	}

@@ -199,6 +199,13 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	// deleted records whether the store-side removal of an itemDelete message
+	// actually removed an entry. Stale deletes must not touch policy accounting.
+	deleted bool
+	// fromStore marks an itemDelete produced by Cache.Del, whose store removal
+	// already happened. Bare itemDelete messages enqueued internally take the
+	// legacy unconditional policy-delete path instead.
+	fromStore bool
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -374,16 +381,20 @@ func (c *Cache[K, V]) Del(key K) {
 	}
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
-	_, prev := c.storedItems.Del(keyHash, conflictHash)
+	conflict, prev, _, removed := c.storedItems.Del(keyHash, conflictHash)
 	c.onExit(prev)
-	// If we've set an item, it would be applied slightly later.
-	// So we must push the same item to `setBuf` with the deletion flag.
-	// This ensures that if a set is followed by a delete, it will be
-	// applied in the correct order.
+
+	// The store is the single authority for whether the key is gone. Only
+	// when the delete actually removed an entry do we need to reclaim its
+	// policy cost; a re-Set landing before the buffered message is processed
+	// owns a fresh ledger entry and must not be erased by a stale delete.
 	c.setBuf <- &Item[V]{
-		flag:     itemDelete,
-		Key:      keyHash,
-		Conflict: conflictHash,
+		flag:      itemDelete,
+		Key:       keyHash,
+		Conflict:  conflict,
+		Value:     prev,
+		deleted:   removed,
+		fromStore: true,
 	}
 }
 
@@ -507,6 +518,32 @@ func (c *Cache[K, V]) RemainingCost() int64 {
 	return c.cachePolicy.Cap()
 }
 
+// classifyVictims splits store-confirmed removals into TTL expirations and
+// capacity evictions so each event updates its own counters. The returned
+// slice preserves every removed item for the onEvict callback.
+func (c *Cache[K, V]) classifyVictims(removed []*Item[V]) []*Item[V] {
+	now := time.Now()
+	evicted := make([]*Item[V], 0, len(removed))
+	for _, victim := range removed {
+		expired := !victim.Expiration.IsZero() && !victim.Expiration.After(now)
+		var cost int64
+		if expired {
+			cost = c.cachePolicy.RemoveAccounting(victim.Key)
+		} else {
+			cost = c.cachePolicy.EvictAccounting(victim.Key)
+		}
+		if cost < 0 {
+			// The ledger entry was already reclaimed by another path; the
+			// item is still gone from the store, so notify onEvict once.
+			evicted = append(evicted, victim)
+			continue
+		}
+		victim.Cost = cost
+		evicted = append(evicted, victim)
+	}
+	return evicted
+}
+
 // processItems is ran by goroutines processing the Set buffer.
 func (c *Cache[K, V]) processItems() {
 	startTs := make(map[uint64]time.Time)
@@ -554,26 +591,58 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
-				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
+				candidates, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
 					c.Metrics.add(keyAdd, i.Key, 1)
 					trackAdmission(i.Key)
+
+					// Remove victims from the store first; only entries that
+					// were actually deleted get their ledger cost reclaimed.
+					removed := make([]*Item[V], 0, len(candidates))
+					for _, victim := range candidates {
+						conflict, value, expiration, ok := c.storedItems.Del(victim.Key, 0)
+						if !ok {
+							// The entry was refreshed/re-added concurrently;
+							// it owns its own ledger entry, so keep it.
+							continue
+						}
+						victim.Conflict = conflict
+						victim.Value = value
+						victim.Expiration = expiration
+						removed = append(removed, victim)
+					}
+					victims := c.classifyVictims(removed)
+					for _, victim := range victims {
+						onEvict(victim)
+					}
 				} else {
 					c.onReject(i)
-				}
-				for _, victim := range victims {
-					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
-					onEvict(victim)
 				}
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
 
 			case itemDelete:
-				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
-				_, val := c.storedItems.Del(i.Key, i.Conflict)
-				c.onExit(val)
+				// Cache.Del performs the store removal up front and records
+				// the outcome in i.deleted: a no-op delete means the key was
+				// already removed/refreshed, so its ledger must be left
+				// alone. Internal callers that enqueue a bare itemDelete
+				// (without a preceding store removal) keep the legacy
+				// behaviour of unconditionally dropping the policy entry.
+				if i.fromStore {
+					if !i.deleted {
+						continue
+					}
+					c.cachePolicy.EvictAccounting(i.Key)
+				} else {
+					// Legacy path for bare itemDelete messages enqueued
+					// internally: remove both the store entry and its ledger
+					// cost. Public Cache.Del uses the store-first path above.
+					if _, _, _, removed := c.storedItems.Del(i.Key, i.Conflict); removed {
+						c.cachePolicy.Del(i.Key)
+					}
+				}
 			}
 		case <-c.cleanupTicker.C:
 			c.storedItems.Cleanup(c.cachePolicy, onEvict)
@@ -611,6 +680,11 @@ const (
 	// floor.
 	dropGets
 	keepGets
+	// The following 2 keep track of keys and cost reclaimed by TTL expiration.
+	// They are intentionally separate from the eviction counters so capacity
+	// eviction and time-based expiration never overwrite one another's stats.
+	keyExpired
+	costExpired
 	// This should be the final enum. Other enums should be set before this.
 	doNotUse
 )
@@ -639,6 +713,10 @@ func stringFor(t metricType) string {
 		return "gets-dropped"
 	case keepGets:
 		return "gets-kept"
+	case keyExpired:
+		return "keys-expired"
+	case costExpired:
+		return "cost-expired"
 	default:
 		return "unidentified"
 	}
@@ -714,6 +792,11 @@ func (p *Metrics) KeysEvicted() uint64 {
 	return p.get(keyEvict)
 }
 
+// KeysExpired is the total number of keys removed by TTL expiration cleanup.
+func (p *Metrics) KeysExpired() uint64 {
+	return p.get(keyExpired)
+}
+
 // CostAdded is the sum of costs that have been added (successful Set calls).
 func (p *Metrics) CostAdded() uint64 {
 	return p.get(costAdd)
@@ -722,6 +805,11 @@ func (p *Metrics) CostAdded() uint64 {
 // CostEvicted is the sum of all costs that have been evicted.
 func (p *Metrics) CostEvicted() uint64 {
 	return p.get(costEvict)
+}
+
+// CostExpired is the sum of all costs reclaimed by TTL expiration cleanup.
+func (p *Metrics) CostExpired() uint64 {
+	return p.get(costExpired)
 }
 
 // SetsDropped is the number of Set calls that don't make it into internal

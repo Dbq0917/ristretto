@@ -213,15 +213,15 @@ func TestSampledLFUSample(t *testing.T) {
 		{1, 1},
 		{2, 2},
 		{3, 3},
-	})
+	}, nil)
 	k := sample[len(sample)-1].key
 	require.Equal(t, 5, len(sample))
 	require.NotEqual(t, 1, k)
 	require.NotEqual(t, 2, k)
 	require.NotEqual(t, 3, k)
-	require.Equal(t, len(sample), len(e.fillSample(sample)))
+	require.Equal(t, len(sample), len(e.fillSample(sample, nil)))
 	e.del(5)
-	sample = e.fillSample(sample[:len(sample)-2])
+	sample = e.fillSample(sample[:len(sample)-2], nil)
 	require.Equal(t, 4, len(sample))
 }
 

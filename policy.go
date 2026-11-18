@@ -19,6 +19,16 @@ const (
 	lfuSample = 5
 )
 
+// policyEvictor is the subset of the cache policy that expiration cleanup
+// needs. Cleanup must only adjust cost accounting for entries whose removal
+// from the store was actually confirmed; it never drives admission/eviction
+// decisions itself.
+type policyEvictor[V any] interface {
+	// RemoveAccounting drops the key's cost from the ledger and returns the
+	// cost that was accounted (or -1 when the key was not tracked).
+	RemoveAccounting(key uint64) int64
+}
+
 func newPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 	return newDefaultPolicy[V](numCounters, maxCost)
 }
@@ -89,9 +99,16 @@ func (p *defaultPolicy[V]) Push(keys []uint64) bool {
 	}
 }
 
-// Add decides whether the item with the given key and cost should be accepted by
-// the policy. It returns the list of victims that have been evicted and a boolean
-// indicating whether the incoming item should be accepted.
+// Add decides whether the item with the given key and cost should be accepted
+// by the policy. It returns the candidate victims selected for eviction and a
+// boolean indicating whether the incoming item should be accepted.
+//
+// Victim selection only mutates the admission/frequency state; the cost
+// ledger and keyCosts entries of victims are reclaimed via
+// EvictAccounting/RemoveAccounting only once the caller has confirmed that
+// the store actually removed them. Keeping the store as the single deletion
+// authority prevents a concurrent re-Set from resurrecting an entry whose
+// cost had already been subtracted.
 func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	p.Lock()
 	defer p.Unlock()
@@ -127,12 +144,16 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	sample := make([]*policyPair, 0, lfuSample)
 	// As items are evicted they will be appended to victims.
 	victims := make([]*Item[V], 0)
+	var pendingCost int64
 
-	// Delete victims until there's enough space or a minKey is found that has
-	// more hits than incoming item.
-	for ; room < 0; room = p.evict.roomLeft(cost) {
-		// Fill up empty slots in sample.
-		sample = p.evict.fillSample(sample)
+	// Select victims until there is enough space or a minKey is found that
+	// has more hits than the incoming item. keyCosts entries stay intact here:
+	// the cost is only reclaimed after the caller confirms the store removal,
+	// so a failed (raced) delete cannot lose the ledger entry. pendingCost
+	// models the space the pending removals will free.
+	for ; room+pendingCost < 0; room = p.evict.roomLeft(cost) {
+		// Fill up empty slots in sample, skipping keys already selected.
+		sample = p.evict.fillSample(sample, p.victimKeys(victims))
 
 		// Find minimally used item in sample.
 		minKey, minHits, minId, minCost := uint64(0), int64(math.MaxInt64), 0, int64(0)
@@ -143,24 +164,28 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 			}
 		}
 
+		// No fresh candidate left (everything is already a pending victim).
+		// Stop selecting and let the caller's store-confirmed removal decide;
+		// this also bounds the loop when deletes race against refreshes.
+		if len(sample) == 0 {
+			break
+		}
+
 		// If the incoming item isn't worth keeping in the policy, reject.
 		if incHits < minHits {
 			p.metrics.add(rejectSets, key, 1)
 			return victims, false
 		}
 
-		// Delete the victim from metadata.
-		p.evict.del(minKey)
-
-		// Delete the victim from sample.
+		// Record the victim for deferred, store-confirmed accounting.
 		sample[minId] = sample[len(sample)-1]
 		sample = sample[:len(sample)-1]
-		// Store victim in evicted victims slice.
 		victims = append(victims, &Item[V]{
 			Key:      minKey,
 			Conflict: 0,
 			Cost:     minCost,
 		})
+		pendingCost += minCost
 	}
 
 	p.evict.add(key, cost)
@@ -175,10 +200,43 @@ func (p *defaultPolicy[V]) Has(key uint64) bool {
 	return exists
 }
 
+// victimKeys returns the set of keys already chosen as eviction victims
+// within the current Add call, so they are not sampled twice.
+func (p *defaultPolicy[V]) victimKeys(victims []*Item[V]) map[uint64]struct{} {
+	excluded := make(map[uint64]struct{}, len(victims))
+	for _, victim := range victims {
+		excluded[victim.Key] = struct{}{}
+	}
+	return excluded
+}
+
 func (p *defaultPolicy[V]) Del(key uint64) {
 	p.Lock()
 	p.evict.del(key)
 	p.Unlock()
+}
+
+// RemoveAccounting reclaims the cost of a key whose removal the store has
+// confirmed. Unlike Del it does not emit eviction statistics, because TTL
+// expiration and capacity eviction are separate events that must not be
+// counted against each other.
+func (p *defaultPolicy[V]) RemoveAccounting(key uint64) int64 {
+	p.Lock()
+	defer p.Unlock()
+	return p.evict.removeAccounting(key)
+}
+
+// EvictAccounting reclaims cost for a store-confirmed explicit delete and
+// records it using the eviction counters.
+func (p *defaultPolicy[V]) EvictAccounting(key uint64) int64 {
+	p.Lock()
+	defer p.Unlock()
+	cost, found := p.evict.keyCosts[key]
+	if !found {
+		return -1
+	}
+	p.evict.del(key)
+	return cost
 }
 
 func (p *defaultPolicy[V]) Cap() int64 {
@@ -272,11 +330,14 @@ func (p *sampledLFU) roomLeft(cost int64) int64 {
 	return p.getMaxCost() - (p.used + cost)
 }
 
-func (p *sampledLFU) fillSample(in []*policyPair) []*policyPair {
+func (p *sampledLFU) fillSample(in []*policyPair, exclude map[uint64]struct{}) []*policyPair {
 	if len(in) >= lfuSample {
 		return in
 	}
 	for key, cost := range p.keyCosts {
+		if _, skip := exclude[key]; skip {
+			continue
+		}
 		in = append(in, &policyPair{key, cost})
 		if len(in) >= lfuSample {
 			return in
@@ -294,6 +355,21 @@ func (p *sampledLFU) del(key uint64) {
 	delete(p.keyCosts, key)
 	p.metrics.add(costEvict, key, uint64(cost))
 	p.metrics.add(keyEvict, key, 1)
+}
+
+// removeAccounting reclaims the key's cost without recording an eviction. It is
+// used by TTL cleanup, where the store is the authority deciding whether an
+// entry is actually gone. Returning -1 tells the caller the key was unknown.
+func (p *sampledLFU) removeAccounting(key uint64) int64 {
+	cost, ok := p.keyCosts[key]
+	if !ok {
+		return -1
+	}
+	p.used -= cost
+	delete(p.keyCosts, key)
+	p.metrics.add(costExpired, key, uint64(cost))
+	p.metrics.add(keyExpired, key, 1)
+	return cost
 }
 
 func (p *sampledLFU) add(key uint64, cost int64) {

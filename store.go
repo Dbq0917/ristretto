@@ -36,12 +36,17 @@ type store[V any] interface {
 	// item object.
 	Set(*Item[V])
 	// Del deletes the key-value pair from the Map.
-	Del(uint64, uint64) (uint64, V)
+	Del(uint64, uint64) (uint64, V, time.Time, bool)
+	// DelExpired deletes the key only if the stored entry still matches the
+	// expiration version captured by the cleanup goroutine. It returns the
+	// deleted item (or false when the entry was refreshed/removed in the
+	// meantime, in which case the caller must not touch the accounting).
+	DelExpired(key, conflict uint64, expiration time.Time) (*Item[V], bool)
 	// Update attempts to update the key with a new value and returns true if
 	// successful.
 	Update(*Item[V]) (V, bool)
 	// Cleanup removes items that have an expired TTL.
-	Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V]))
+	Cleanup(policy policyEvictor[V], onEvict func(item *Item[V]))
 	// Clear clears all contents of the store.
 	Clear(onEvict func(item *Item[V]))
 	SetShouldUpdateFn(f updateFn[V])
@@ -123,15 +128,19 @@ func (sm *shardedMap[V]) Set(i *Item[V]) {
 	sm.shards[i.Key%numShards].Set(i)
 }
 
-func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V) {
+func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V, time.Time, bool) {
 	return sm.shards[key%numShards].Del(key, conflict)
+}
+
+func (sm *shardedMap[V]) DelExpired(key, conflict uint64, expiration time.Time) (*Item[V], bool) {
+	return sm.shards[key%numShards].delExpired(key, conflict, expiration)
 }
 
 func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, bool) {
 	return sm.shards[newItem.Key%numShards].Update(newItem)
 }
 
-func (sm *shardedMap[V]) Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V])) {
+func (sm *shardedMap[V]) Cleanup(policy policyEvictor[V], onEvict func(item *Item[V])) {
 	sm.expiryMap.cleanup(sm, policy, onEvict)
 }
 
@@ -221,15 +230,15 @@ func (m *lockedMap[V]) Set(i *Item[V]) {
 	}
 }
 
-func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
+func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V, time.Time, bool) {
 	m.Lock()
 	defer m.Unlock()
 	item, ok := m.data[key]
 	if !ok {
-		return 0, zeroValue[V]()
+		return 0, zeroValue[V](), time.Time{}, false
 	}
 	if conflict != 0 && (conflict != item.conflict) {
-		return 0, zeroValue[V]()
+		return 0, zeroValue[V](), time.Time{}, false
 	}
 
 	if !item.expiration.IsZero() {
@@ -237,7 +246,38 @@ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
 	}
 
 	delete(m.data, key)
-	return item.conflict, item.value
+	return item.conflict, item.value, item.expiration, true
+}
+
+// delExpired removes the entry only if it is still the exact expiration
+// version that the cleanup goroutine observed. A concurrent SetWithTTL moves
+// the key to a newer expiration bucket, so checking the expiration time under
+// the shard lock makes refresh-vs-cleanup races resolve in favour of the
+// freshest writer without any cross-shard global lock.
+func (m *lockedMap[V]) delExpired(key, conflict uint64, expiration time.Time) (*Item[V], bool) {
+	m.Lock()
+	defer m.Unlock()
+	item, ok := m.data[key]
+	if !ok {
+		return nil, false
+	}
+	if conflict != 0 && conflict != item.conflict {
+		return nil, false
+	}
+	// The entry was refreshed (new expiration, including no-expiration) or
+	// re-added after a delete: its ledger entry is owned by the writer now.
+	if !item.expiration.Equal(expiration) {
+		return nil, false
+	}
+
+	m.em.del(key, item.expiration)
+	delete(m.data, key)
+	return &Item[V]{
+		Key:        item.key,
+		Conflict:   item.conflict,
+		Value:      item.value,
+		Expiration: item.expiration,
+	}, true
 }
 
 func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
