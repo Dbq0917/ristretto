@@ -49,6 +49,8 @@ type Cache[K Key, V any] struct {
 	// setBuf is a buffer allowing us to batch/drop Sets during times of high
 	// contention.
 	setBuf chan *Item[V]
+	// evictions runs OnEvict callbacks outside the write-processing goroutine.
+	evictions *evictionQueue[V]
 	// onEvict is called for item evictions.
 	onEvict func(*Item[V])
 	// onReject is called when an item is rejected via admission policy.
@@ -126,7 +128,10 @@ type Config[K Key, V any] struct {
 	// flag to true when testing or throughput performance isn't a major factor.
 	Metrics bool
 
-	// OnEvict is called for every eviction with the evicted item.
+	// OnEvict is called for every eviction with the evicted item. Callbacks are
+	// executed asynchronously by a dedicated worker, so a slow callback does not
+	// block cache writes. Use Cache.WaitForEvictions or Cache.Close to wait for
+	// pending callbacks.
 	OnEvict func(item *Item[V])
 
 	// OnReject is called for every rejection done via the policy.
@@ -238,11 +243,16 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 			config.OnExit(val)
 		}
 	}
-	cache.onEvict = func(item *Item[V]) {
-		if config.OnEvict != nil {
-			config.OnEvict(item)
-		}
-		cache.onExit(item.Value)
+	if config.OnEvict != nil || config.OnExit != nil {
+		cache.evictions = newEvictionQueue(func(item *Item[V]) {
+			if config.OnEvict != nil {
+				config.OnEvict(item)
+			}
+			cache.onExit(item.Value)
+		})
+		cache.onEvict = cache.evictions.enqueue
+	} else {
+		cache.onEvict = func(*Item[V]) {}
 	}
 	cache.onReject = func(item *Item[V]) {
 		if config.OnReject != nil {
@@ -265,7 +275,8 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 }
 
 // Wait blocks until all buffered writes have been applied. This ensures a call to Set()
-// will be visible to future calls to Get().
+// will be visible to future calls to Get(). It does not wait for asynchronous
+// OnEvict callbacks; use WaitForEvictions for that.
 func (c *Cache[K, V]) Wait() {
 	if c == nil || c.isClosed.Load() {
 		return
@@ -273,6 +284,16 @@ func (c *Cache[K, V]) Wait() {
 	wait := make(chan struct{})
 	c.setBuf <- &Item[V]{wait: wait}
 	<-wait
+}
+
+// WaitForEvictions blocks until all eviction callbacks enqueued before the call
+// have completed. It does not wait for evictions that happen after the call
+// starts.
+func (c *Cache[K, V]) WaitForEvictions() {
+	if c == nil {
+		return
+	}
+	c.evictions.flush()
 }
 
 // Get returns the value (if any) and a boolean representing whether the
@@ -439,6 +460,7 @@ func (c *Cache[K, V]) Close() {
 	close(c.setBuf)
 	c.cachePolicy.Close()
 	c.cleanupTicker.Stop()
+	c.evictions.close()
 	c.isClosed.Store(true)
 }
 
@@ -475,6 +497,7 @@ loop:
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
+	c.evictions.flush()
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
