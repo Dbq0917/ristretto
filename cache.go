@@ -159,13 +159,12 @@ type Config[K Key, V any] struct {
 	// just return the first uint64 and return 0 for the second uint64.
 	KeyToHash func(key K) (uint64, uint64)
 
-	// Cost evaluates a value and outputs a corresponding cost. This function is ran
-	// after Set is called for a new item or an item is updated with a cost param of 0.
+	// Cost evaluates a value and outputs a corresponding cost. This function is
+	// run when Set is called with a cost parameter of 0.
 	//
-	// Cost is an optional function you can pass to the Config in order to evaluate
-	// item cost at runtime, and only whentthe Set call isn't going to be dropped. This
-	// is useful if calculating item cost is particularly expensive and you don't want to
-	// waste time on items that will be dropped anyways.
+	// Cost is evaluated on the write path so the cache can reserve capacity
+	// before buffering the value. It may still be called for a write which is
+	// dropped later because the reservation limit has been reached.
 	//
 	// To signal to Ristretto that you'd like to use this Cost function:
 	//   1. Set the Cost field to a non-nil function.
@@ -199,6 +198,9 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	reserved   int64
+	overflow   bool
+	costReady  bool
 }
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
@@ -345,23 +347,79 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Cost:       cost,
 		Expiration: expiration,
 	}
-	// cost is eventually updated. The expiration must also be immediately updated
-	// to prevent items from being prematurely removed from the map.
-	if prev, ok := c.storedItems.Update(i); ok {
-		c.onExit(prev)
-		i.flag = itemUpdate
+
+	// Resolve the cost on the write path so the reservation below covers the
+	// value which is about to become reachable from the store or set buffer.
+	if i.Cost == 0 && c.cost != nil {
+		i.Cost = c.cost(value)
 	}
+	if !c.ignoreInternalCost {
+		i.Cost += itemSize
+	}
+	i.costReady = true
+
+	// Items larger than the whole cache can never be admitted. Reject them
+	// before they occupy memory in the set buffer.
+	if i.Cost > c.cachePolicy.MaxCost() {
+		c.Metrics.add(rejectSets, keyHash, 1)
+		c.onReject(i)
+		return true
+	}
+
+	if oldCost, ok := c.storedItems.Cost(keyHash, conflictHash); ok {
+		// Updates replace the stored value immediately, so reserve only the
+		// positive cost delta. This keeps the write cheap while ensuring the
+		// asynchronous policy update cannot let the store grow unbounded.
+		reserved := i.Cost - oldCost
+		if reserved > 0 {
+			ok, overflow := c.cachePolicy.reserve(reserved, false)
+			if !ok {
+				c.Metrics.add(dropSets, keyHash, 1)
+				return false
+			}
+			i.overflow = overflow
+		}
+
+		prev, _, result := c.storedItems.UpdateWithCost(i)
+		switch result {
+		case storeUpdateApplied:
+			c.onExit(prev)
+			i.flag = itemUpdate
+			i.reserved = reserved
+		case storeUpdateRejected:
+			c.cachePolicy.release(reserved, i.overflow)
+			return true
+		case storeUpdateNotFound:
+			// The key was removed between the cost lookup and the update.
+			// Treat this write as a new item.
+			c.cachePolicy.release(reserved, i.overflow)
+			i.overflow = false
+		}
+	}
+
+	if i.flag == itemNew {
+		ok, overflow := c.cachePolicy.reserve(i.Cost, true)
+		if !ok {
+			c.Metrics.add(dropSets, keyHash, 1)
+			return false
+		}
+		i.reserved = i.Cost
+		i.overflow = overflow
+	}
+
 	// Attempt to send item to cachePolicy.
 	select {
 	case c.setBuf <- i:
 		return true
 	default:
 		if i.flag == itemUpdate {
-			// Return true if this was an update operation since we've already
-			// updated the storedItems. For all the other operations (set/delete), we
-			// return false which means the item was not inserted.
+			// The value is already updated in the store. Block until the policy
+			// catches up instead of dropping the cost update and leaving the
+			// policy permanently out of sync.
+			c.setBuf <- i
 			return true
 		}
+		c.cachePolicy.release(i.reserved, i.overflow)
 		c.Metrics.add(dropSets, keyHash, 1)
 		return false
 	}
@@ -462,6 +520,7 @@ loop:
 				close(i.wait)
 				continue
 			}
+			c.cachePolicy.release(i.reserved, i.overflow)
 			if i.flag != itemUpdate {
 				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
 				// onEvict here.
@@ -499,7 +558,8 @@ func (c *Cache[K, V]) UpdateMaxCost(maxCost int64) {
 	c.cachePolicy.UpdateMaxCost(maxCost)
 }
 
-// RemainingCost returns the remaining cost capacity (MaxCost - Used) of an existing cache.
+// RemainingCost returns the remaining cost capacity (MaxCost - Used) of an
+// existing cache. Reserved cost for buffered writes is included in Used.
 func (c *Cache[K, V]) RemainingCost() int64 {
 	if c == nil {
 		return 0
@@ -544,12 +604,15 @@ func (c *Cache[K, V]) processItems() {
 				continue
 			}
 			// Calculate item cost value if new or update.
-			if i.Cost == 0 && c.cost != nil && i.flag != itemDelete {
-				i.Cost = c.cost(i.Value)
-			}
-			if !c.ignoreInternalCost {
-				// Add the cost of internally storing the object.
-				i.Cost += itemSize
+			if !i.costReady {
+				if i.Cost == 0 && c.cost != nil && i.flag != itemDelete {
+					i.Cost = c.cost(i.Value)
+				}
+				if !c.ignoreInternalCost {
+					// Add the cost of internally storing the object.
+					i.Cost += itemSize
+				}
+				i.costReady = true
 			}
 
 			switch i.flag {
@@ -566,14 +629,17 @@ func (c *Cache[K, V]) processItems() {
 					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
 					onEvict(victim)
 				}
+				c.cachePolicy.release(i.reserved, i.overflow)
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
+				c.cachePolicy.release(i.reserved, i.overflow)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
 				_, val := c.storedItems.Del(i.Key, i.Conflict)
 				c.onExit(val)
+				c.cachePolicy.release(i.reserved, i.overflow)
 			}
 		case <-c.cleanupTicker.C:
 			c.storedItems.Cleanup(c.cachePolicy, onEvict)

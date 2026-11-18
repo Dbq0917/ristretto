@@ -16,9 +16,18 @@ type updateFn[V any] func(cur, prev V) bool
 type storeItem[V any] struct {
 	key        uint64
 	conflict   uint64
+	cost       int64
 	value      V
 	expiration time.Time
 }
+
+type storeUpdateResult uint8
+
+const (
+	storeUpdateNotFound storeUpdateResult = iota
+	storeUpdateRejected
+	storeUpdateApplied
+)
 
 // store is the interface fulfilled by all hash map implementations in this
 // file. Some hash map implementations are better suited for certain data
@@ -29,6 +38,8 @@ type storeItem[V any] struct {
 type store[V any] interface {
 	// Get returns the value associated with the key parameter.
 	Get(uint64, uint64) (V, bool)
+	// Cost returns the cost associated with the key parameter.
+	Cost(uint64, uint64) (int64, bool)
 	// Expiration returns the expiration time for this key.
 	Expiration(uint64) time.Time
 	// Set adds the key-value pair to the Map or updates the value if it's
@@ -40,6 +51,9 @@ type store[V any] interface {
 	// Update attempts to update the key with a new value and returns true if
 	// successful.
 	Update(*Item[V]) (V, bool)
+	// UpdateWithCost attempts to update the key and returns the previous value,
+	// previous cost, and the result of the update.
+	UpdateWithCost(*Item[V]) (V, int64, storeUpdateResult)
 	// Cleanup removes items that have an expired TTL.
 	Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V]))
 	// Clear clears all contents of the store.
@@ -110,6 +124,10 @@ func (sm *shardedMap[V]) Get(key, conflict uint64) (V, bool) {
 	return sm.shards[key%numShards].get(key, conflict)
 }
 
+func (sm *shardedMap[V]) Cost(key, conflict uint64) (int64, bool) {
+	return sm.shards[key%numShards].Cost(key, conflict)
+}
+
 func (sm *shardedMap[V]) Expiration(key uint64) time.Time {
 	return sm.shards[key%numShards].Expiration(key)
 }
@@ -129,6 +147,10 @@ func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V) {
 
 func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, bool) {
 	return sm.shards[newItem.Key%numShards].Update(newItem)
+}
+
+func (sm *shardedMap[V]) UpdateWithCost(newItem *Item[V]) (V, int64, storeUpdateResult) {
+	return sm.shards[newItem.Key%numShards].UpdateWithCost(newItem)
 }
 
 func (sm *shardedMap[V]) Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V])) {
@@ -181,6 +203,19 @@ func (m *lockedMap[V]) get(key, conflict uint64) (V, bool) {
 	return item.value, true
 }
 
+func (m *lockedMap[V]) Cost(key, conflict uint64) (int64, bool) {
+	m.RLock()
+	defer m.RUnlock()
+	item, ok := m.data[key]
+	if !ok {
+		return 0, false
+	}
+	if conflict != 0 && conflict != item.conflict {
+		return 0, false
+	}
+	return item.cost, true
+}
+
 func (m *lockedMap[V]) Expiration(key uint64) time.Time {
 	m.RLock()
 	defer m.RUnlock()
@@ -216,6 +251,7 @@ func (m *lockedMap[V]) Set(i *Item[V]) {
 	m.data[i.Key] = storeItem[V]{
 		key:        i.Key,
 		conflict:   i.Conflict,
+		cost:       i.Cost,
 		value:      i.Value,
 		expiration: i.Expiration,
 	}
@@ -241,28 +277,34 @@ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
 }
 
 func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
+	prev, _, result := m.UpdateWithCost(newItem)
+	return prev, result == storeUpdateApplied
+}
+
+func (m *lockedMap[V]) UpdateWithCost(newItem *Item[V]) (V, int64, storeUpdateResult) {
 	m.Lock()
 	defer m.Unlock()
 	item, ok := m.data[newItem.Key]
 	if !ok {
-		return zeroValue[V](), false
+		return zeroValue[V](), 0, storeUpdateNotFound
 	}
 	if newItem.Conflict != 0 && (newItem.Conflict != item.conflict) {
-		return zeroValue[V](), false
+		return zeroValue[V](), item.cost, storeUpdateRejected
 	}
 	if m.shouldUpdate != nil && !m.shouldUpdate(newItem.Value, item.value) {
-		return item.value, false
+		return item.value, item.cost, storeUpdateRejected
 	}
 
 	m.em.update(newItem.Key, newItem.Conflict, item.expiration, newItem.Expiration)
 	m.data[newItem.Key] = storeItem[V]{
 		key:        newItem.Key,
 		conflict:   newItem.Conflict,
+		cost:       newItem.Cost,
 		value:      newItem.Value,
 		expiration: newItem.Expiration,
 	}
 
-	return item.value, true
+	return item.value, item.cost, storeUpdateApplied
 }
 
 func (m *lockedMap[V]) Clear(onEvict func(item *Item[V])) {

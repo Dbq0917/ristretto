@@ -17,6 +17,12 @@ const (
 	// lfuSample is the number of items to sample when looking at eviction
 	// candidates. 5 seems to be the most optimal number [citation needed].
 	lfuSample = 5
+
+	// maxCostOvershootDivisor bounds the cost that can be in flight between
+	// Set and the asynchronous policy update to MaxCost/20 (5%). This keeps
+	// batch writes from growing the store far past MaxCost without putting
+	// the write path behind the policy mutex.
+	maxCostOvershootDivisor = 20
 )
 
 func newPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
@@ -32,6 +38,12 @@ type defaultPolicy[V any] struct {
 	done     chan struct{}
 	isClosed bool
 	metrics  *Metrics
+	// inFlight is the cost reserved by write operations which have not been
+	// reconciled with the eviction policy yet. It is deliberately lock-free.
+	inFlight atomic.Int64
+	// overflow is the cost of the single reservation currently allowed beyond
+	// the normal limit. It makes room for one item which will cause eviction.
+	overflow atomic.Int64
 }
 
 func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
@@ -183,9 +195,53 @@ func (p *defaultPolicy[V]) Del(key uint64) {
 
 func (p *defaultPolicy[V]) Cap() int64 {
 	p.Lock()
-	capacity := p.evict.getMaxCost() - p.evict.used
+	capacity := p.evict.getMaxCost() - atomic.LoadInt64(&p.evict.used) - p.inFlight.Load()
 	p.Unlock()
 	return capacity
+}
+
+// reserve claims cost for a write before it enters the asynchronous set
+// buffer. The reservation is lock-free and includes the small bounded
+// overshoot allowance so concurrent writers cannot accumulate an unbounded
+// amount of unaccounted memory.
+func (p *defaultPolicy[V]) reserve(cost int64, allowOverflow bool) (bool, bool) {
+	if cost <= 0 {
+		return true, false
+	}
+
+	maxCost := p.evict.getMaxCost()
+	limit := maxCost + maxCost/maxCostOvershootDivisor
+	if cost > limit {
+		return false, false
+	}
+
+	// Optimistically claim the cost with a single atomic update. If the claim
+	// loses a race for the remaining budget, put it back and let the caller drop
+	// the write. This keeps the common write path a non-blocking RMW instead of
+	// a CAS retry loop.
+	inFlight := p.inFlight.Add(cost)
+	used := atomic.LoadInt64(&p.evict.used)
+	if used <= limit && inFlight <= limit-used {
+		return true, false
+	}
+	p.inFlight.Add(-cost)
+
+	// Allow one item beyond the normal limit so a write which will trigger
+	// eviction can still reach the policy.
+	if !allowOverflow || !p.overflow.CompareAndSwap(0, cost) {
+		return false, false
+	}
+	p.inFlight.Add(cost)
+	return true, true
+}
+
+func (p *defaultPolicy[V]) release(cost int64, overflow bool) {
+	if cost > 0 {
+		p.inFlight.Add(-cost)
+		if overflow {
+			p.overflow.Store(0)
+		}
+	}
 }
 
 func (p *defaultPolicy[V]) Update(key uint64, cost int64) {
@@ -208,6 +264,8 @@ func (p *defaultPolicy[V]) Clear() {
 	p.Lock()
 	p.admit.clear()
 	p.evict.clear()
+	p.inFlight.Store(0)
+	p.overflow.Store(0)
 	p.Unlock()
 }
 
@@ -269,7 +327,7 @@ func (p *sampledLFU) updateMaxCost(maxCost int64) {
 }
 
 func (p *sampledLFU) roomLeft(cost int64) int64 {
-	return p.getMaxCost() - (p.used + cost)
+	return p.getMaxCost() - (atomic.LoadInt64(&p.used) + cost)
 }
 
 func (p *sampledLFU) fillSample(in []*policyPair) []*policyPair {
@@ -290,7 +348,7 @@ func (p *sampledLFU) del(key uint64) {
 	if !ok {
 		return
 	}
-	p.used -= cost
+	atomic.AddInt64(&p.used, -cost)
 	delete(p.keyCosts, key)
 	p.metrics.add(costEvict, key, uint64(cost))
 	p.metrics.add(keyEvict, key, 1)
@@ -298,7 +356,7 @@ func (p *sampledLFU) del(key uint64) {
 
 func (p *sampledLFU) add(key uint64, cost int64) {
 	p.keyCosts[key] = cost
-	p.used += cost
+	atomic.AddInt64(&p.used, cost)
 }
 
 func (p *sampledLFU) updateIfHas(key uint64, cost int64) bool {
@@ -313,7 +371,7 @@ func (p *sampledLFU) updateIfHas(key uint64, cost int64) bool {
 			diff := cost - prev
 			p.metrics.add(costAdd, key, uint64(diff))
 		}
-		p.used += cost - prev
+		atomic.AddInt64(&p.used, cost-prev)
 		p.keyCosts[key] = cost
 		return true
 	}
@@ -321,7 +379,7 @@ func (p *sampledLFU) updateIfHas(key uint64, cost int64) bool {
 }
 
 func (p *sampledLFU) clear() {
-	p.used = 0
+	atomic.StoreInt64(&p.used, 0)
 	p.keyCosts = make(map[uint64]int64)
 }
 
