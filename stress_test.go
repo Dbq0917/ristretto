@@ -62,6 +62,10 @@ func TestStressHitRatio(t *testing.T) {
 		MaxCost:     100,
 		BufferItems: 64,
 		Metrics:     true,
+		// Costs are item counts, not bytes, so the internal storage cost
+		// must not be added. Otherwise each item costs 1+itemSize and only
+		// a single item fits, while the Clairvoyant oracle below holds 100.
+		IgnoreInternalCost: true,
 	})
 	require.NoError(t, err)
 
@@ -78,6 +82,51 @@ func TestStressHitRatio(t *testing.T) {
 		}
 	}
 	t.Logf("actual: %.2f, optimal: %.2f", c.Metrics.Ratio(), o.Metrics().Ratio())
+}
+
+// TestStressHitRatioShift fills the cache with one hot key set and then shifts
+// the workload to a disjoint key set. Once full, the cache must keep admitting
+// the new hot keys (evicting now-cold ones by value) instead of rejecting new
+// writes, and keys that are actively being read must be protected. Otherwise
+// every access misses and goes back to the origin.
+func TestStressHitRatioShift(t *testing.T) {
+	c, err := NewCache(&Config[uint64, uint64]{
+		NumCounters:        2000,
+		MaxCost:            100,
+		BufferItems:        64,
+		Metrics:            true,
+		IgnoreInternalCost: true,
+	})
+	require.NoError(t, err)
+	defer c.Close()
+
+	// Phase 1: fill the cache with hot keys in [0, 1000).
+	key := sim.NewZipfian(1.0001, 1, 1000)
+	for i := 0; i < 5000; i++ {
+		k, err := key()
+		require.NoError(t, err)
+		if _, ok := c.Get(k); !ok {
+			c.Set(k, k, 1)
+		}
+	}
+	c.Wait()
+	c.Metrics.Clear()
+
+	// Phase 2: hotness shifts to [1000, 2000). The cache must adapt.
+	for i := 0; i < 10000; i++ {
+		k, err := key()
+		require.NoError(t, err)
+		if _, ok := c.Get(k + 1000); !ok {
+			c.Set(k+1000, k+1000, 1)
+		}
+	}
+	c.Wait()
+	// A Zipfian workload over 1000 keys with 100 slots should hit well over
+	// half the time once the cache adapts. If read signals are dropped or new
+	// writes are rejected outright once full, the ratio collapses toward 0.
+	require.Greater(t, c.Metrics.Ratio(), 0.45,
+		"cache failed to adapt after workload shift: %s", c.Metrics.String())
+	t.Logf("post-shift ratio: %.2f, %s", c.Metrics.Ratio(), c.Metrics.String())
 }
 
 // Clairvoyant is a mock cache providing us with optimal hit ratios to compare

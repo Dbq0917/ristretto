@@ -38,7 +38,7 @@ func newDefaultPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
 	p := &defaultPolicy[V]{
 		admit:   newTinyLFU(numCounters),
 		evict:   newSampledLFU(maxCost),
-		itemsCh: make(chan []uint64, 3),
+		itemsCh: make(chan []uint64, 64),
 		stop:    make(chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -127,12 +127,17 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	sample := make([]*policyPair, 0, lfuSample)
 	// As items are evicted they will be appended to victims.
 	victims := make([]*Item[V], 0)
+	// victimKeys tracks keys already chosen as victims so the sampler does
+	// not pick them twice (victims are only evicted once the swap commits).
+	victimKeys := make([]uint64, 0, lfuSample)
 
-	// Delete victims until there's enough space or a minKey is found that has
-	// more hits than incoming item.
-	for ; room < 0; room = p.evict.roomLeft(cost) {
+	// Select victims until there's enough space or a minKey is found that has
+	// more hits than the incoming item. Victims are only evicted once we know
+	// the incoming item will be admitted, so a rejected item never displaces
+	// valuable resident keys (swap-out, not evict-and-reject).
+	for ; room < 0; room += victims[len(victims)-1].Cost {
 		// Fill up empty slots in sample.
-		sample = p.evict.fillSample(sample)
+		sample = p.evict.fillSample(sample, victimKeys)
 
 		// Find minimally used item in sample.
 		minKey, minHits, minId, minCost := uint64(0), int64(math.MaxInt64), 0, int64(0)
@@ -146,13 +151,12 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 		// If the incoming item isn't worth keeping in the policy, reject.
 		if incHits < minHits {
 			p.metrics.add(rejectSets, key, 1)
+			// No victims have been evicted at this point: the swap only
+			// commits once the incoming item is known to be admitted.
 			return victims, false
 		}
 
-		// Delete the victim from metadata.
-		p.evict.del(minKey)
-
-		// Delete the victim from sample.
+		// Delete the victim from the sample so it isn't picked twice.
 		sample[minId] = sample[len(sample)-1]
 		sample = sample[:len(sample)-1]
 		// Store victim in evicted victims slice.
@@ -161,8 +165,14 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 			Conflict: 0,
 			Cost:     minCost,
 		})
+		victimKeys = append(victimKeys, minKey)
 	}
 
+	// The incoming item is worth more than every victim it displaces. Commit
+	// the swap: evict the victims and make room for the new item.
+	for _, victim := range victims {
+		p.evict.del(victim.Key)
+	}
 	p.evict.add(key, cost)
 	p.metrics.add(costAdd, key, uint64(cost))
 	return victims, true
@@ -272,17 +282,31 @@ func (p *sampledLFU) roomLeft(cost int64) int64 {
 	return p.getMaxCost() - (p.used + cost)
 }
 
-func (p *sampledLFU) fillSample(in []*policyPair) []*policyPair {
+func (p *sampledLFU) fillSample(in []*policyPair, skip []uint64) []*policyPair {
 	if len(in) >= lfuSample {
 		return in
 	}
 	for key, cost := range p.keyCosts {
+		// Skip keys already chosen as victims; they are pending eviction and
+		// must not be picked twice.
+		if keyInSlice(key, skip) {
+			continue
+		}
 		in = append(in, &policyPair{key, cost})
 		if len(in) >= lfuSample {
 			return in
 		}
 	}
 	return in
+}
+
+func keyInSlice(key uint64, keys []uint64) bool {
+	for _, k := range keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *sampledLFU) del(key uint64) {
