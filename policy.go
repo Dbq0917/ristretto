@@ -103,6 +103,9 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 
 	// No need to go any further if the item is already in the cache.
 	if has := p.evict.updateIfHas(key, cost); has {
+		// A rewrite is an access: count it so that frequently rewritten
+		// keys aren't treated as cold during eviction.
+		p.admit.Increment(key)
 		// An update does not count as an addition, so return false.
 		return nil, false
 	}
@@ -190,7 +193,11 @@ func (p *defaultPolicy[V]) Cap() int64 {
 
 func (p *defaultPolicy[V]) Update(key uint64, cost int64) {
 	p.Lock()
-	p.evict.updateIfHas(key, cost)
+	if p.evict.updateIfHas(key, cost) {
+		// A rewrite is an access: count it so that frequently rewritten
+		// keys aren't treated as cold during eviction.
+		p.admit.Increment(key)
+	}
 	p.Unlock()
 }
 

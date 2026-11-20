@@ -111,9 +111,29 @@ func TestPolicyCap(t *testing.T) {
 func TestPolicyUpdate(t *testing.T) {
 	p := newDefaultPolicy[int](100, 10)
 	p.Add(1, 1)
+	p.Lock()
+	// A lone add doesn't count as an access yet.
+	require.Equal(t, int64(0), p.admit.Estimate(1))
+	p.Unlock()
+
 	p.Update(1, 2)
 	p.Lock()
 	require.Equal(t, int64(2), p.evict.keyCosts[1])
+	// A rewrite counts as an access.
+	require.Equal(t, int64(1), p.admit.Estimate(1))
+	p.Unlock()
+
+	// Repeated writes to the same key keep bumping its frequency estimate.
+	p.Update(1, 2)
+	p.Update(1, 2)
+	p.Lock()
+	require.Equal(t, int64(3), p.admit.Estimate(1))
+	p.Unlock()
+
+	// Updates to a key the policy doesn't track are no-ops.
+	p.Update(2, 1)
+	p.Lock()
+	require.Equal(t, int64(0), p.admit.Estimate(2))
 	p.Unlock()
 }
 
