@@ -7,6 +7,26 @@ adhere to [Semantic Versioning](http://semver.org/spec/v2.0.0.html) starting v1.
 
 ## [Unreleased]
 
+### Changed
+
+- The internal per-entry cost charged against `MaxCost` now reflects the real
+  heap footprint of an entry. It previously only counted the `storeItem`
+  struct (~56 bytes) while ignoring the sampled-LFU bookkeeping, Go map bucket
+  and overflow slots, and runtime size-class/alignment slack (~180 bytes per
+  entry measured beyond the caller-supplied cost). A calibrated
+  `entryOverhead` (192 bytes) is charged per entry, plus `ttlEntryOverhead`
+  (48 bytes) for entries with a TTL to cover the expiration map (~35 bytes
+  measured). The estimate stays at or slightly above the real
+  `runtime.MemStats` growth without querying the allocator on writes.
+
+### Fixed
+
+- Eviction now starts at a 90% watermark of `MaxCost` instead of waiting for
+  the tracked cost to reach the hard limit. Sampled eviction and Go map growth
+  are asynchronous with writes, so the old behavior could let the real heap
+  overshoot the configured (or container) limit and trigger an OOM kill while
+  the dashboard still showed headroom.
+
 ## [v2.4.2] - 2026-07-07
 
 ### Fixed

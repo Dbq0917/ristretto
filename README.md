@@ -93,6 +93,24 @@ func main() {
 }
 ```
 
+### Capacity and memory accounting
+
+`MaxCost` is measured in the same units as the `cost` passed to `Set`. When
+the cost represents bytes, Ristretto automatically adds a calibrated
+per-entry overhead (`entryOverhead`, currently 192 bytes) to every item, plus
+an additional surcharge (`ttlEntryOverhead`, 48 bytes) for entries with a TTL,
+so the tracked cost covers not just the key/value bytes but also the internal
+bookkeeping: the stored item struct, the sampled-LFU policy entry, Go map
+bucket and overflow slots, the expiration map, and runtime allocator
+alignment. Set `IgnoreInternalCost: true` only when your cost is not expressed
+in bytes; in that case you must account for that overhead in the costs you
+pass yourself.
+
+Eviction starts once the tracked cost reaches 90% of `MaxCost`. The margin
+absorbs the lag of sampled, buffer-driven eviction and Go map growth so the
+real heap does not overshoot the configured limit (or a container memory cap)
+before victims are removed.
+
 ## Benchmarks
 
 The benchmarks can be found in

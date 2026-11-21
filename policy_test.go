@@ -202,7 +202,11 @@ func TestSampledLFURoom(t *testing.T) {
 	e.add(1, 1)
 	e.add(2, 2)
 	e.add(3, 3)
-	require.Equal(t, int64(6), e.roomLeft(4))
+	// roomLeft is measured against the eviction watermark (90% of MaxCost),
+	// not MaxCost itself, so eviction starts before the hard limit.
+	require.Equal(t, int64(16*evictionWatermarkNumerator/evictionWatermarkDenominator-10), e.roomLeft(4))
+	require.Equal(t, int64(14), e.evictionLimit())
+	require.Equal(t, int64(16), e.getMaxCost())
 }
 
 func TestSampledLFUSample(t *testing.T) {

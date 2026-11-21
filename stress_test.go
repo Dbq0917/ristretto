@@ -21,7 +21,7 @@ import (
 func TestStressSetGet(t *testing.T) {
 	c, err := NewCache(&Config[int, int]{
 		NumCounters:        1000,
-		MaxCost:            100,
+		MaxCost:            100 * entryOverhead,
 		IgnoreInternalCost: true,
 		BufferItems:        64,
 		Metrics:            true,

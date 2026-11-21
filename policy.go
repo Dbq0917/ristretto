@@ -17,6 +17,19 @@ const (
 	// lfuSample is the number of items to sample when looking at eviction
 	// candidates. 5 seems to be the most optimal number [citation needed].
 	lfuSample = 5
+
+	// evictionWatermark is the fraction of MaxCost at which new writes must
+	// make room by eviction instead of being admitted directly.
+	//
+	// Eviction is sampled and asynchronous with respect to Set, and the Go
+	// runtime grows maps in discrete jumps while retaining spare heap span.
+	// Waiting until the tracked cost reaches MaxCost before evicting means the
+	// real heap can temporarily run past the configured limit (and, inside a
+	// memory-capped container, get OOM-killed while the dashboard still shows
+	// headroom). Starting eviction slightly below the limit keeps a safety
+	// margin that absorbs that lag.
+	evictionWatermarkNumerator   = 9
+	evictionWatermarkDenominator = 10
 )
 
 func newPolicy[V any](numCounters, maxCost int64) *defaultPolicy[V] {
@@ -108,7 +121,9 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 	}
 
 	// If the execution reaches this point, the key doesn't exist in the cache.
-	// Calculate the remaining room in the cache (usually bytes).
+	// Calculate the remaining room in the cache (usually bytes). The room is
+	// measured against the eviction watermark rather than MaxCost so that
+	// eviction starts before the tracked cost reaches the hard limit.
 	room := p.evict.roomLeft(cost)
 	if room >= 0 {
 		// There's enough room in the cache to store the new item without
@@ -264,12 +279,27 @@ func (p *sampledLFU) getMaxCost() int64 {
 	return atomic.LoadInt64(&p.maxCost)
 }
 
+// evictionLimit is the tracked cost at which eviction must have brought the
+// cache back under the watermark. It is lower than maxCost to keep a safety
+// margin for the sampled/asynchronous nature of eviction and for runtime
+// allocator slack (map growth buckets and size-class alignment).
+func (p *sampledLFU) evictionLimit() int64 {
+	maxCost := p.getMaxCost()
+	limit := maxCost * evictionWatermarkNumerator / evictionWatermarkDenominator
+	// Never make the effective limit smaller than a single item's worth of
+	// room, otherwise tiny caches could not store anything.
+	if limit <= 0 {
+		return maxCost
+	}
+	return limit
+}
+
 func (p *sampledLFU) updateMaxCost(maxCost int64) {
 	atomic.StoreInt64(&p.maxCost, maxCost)
 }
 
 func (p *sampledLFU) roomLeft(cost int64) int64 {
-	return p.getMaxCost() - (p.used + cost)
+	return p.evictionLimit() - (p.used + cost)
 }
 
 func (p *sampledLFU) fillSample(in []*policyPair) []*policyPair {
