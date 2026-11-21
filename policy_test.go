@@ -81,8 +81,29 @@ func TestPolicyAdd(t *testing.T) {
 	require.NotNil(t, victims)
 	require.True(t, added)
 
+	// Key 4 has no frequency history and the sketch is still warming up, so it
+	// gets the cold-start benefit of the doubt and is admitted (evicting a
+	// resident key) instead of being rejected as a presumed low-frequency key.
 	victims, added = p.Add(4, 20)
 	require.NotNil(t, victims)
+	require.True(t, added)
+
+	// Once the sketch has left the cold-start window, the strict frequency
+	// comparison is back: an unknown key loses against a measured resident key.
+	p.Lock()
+	for i := int64(0); i < p.admit.resetAt; i++ {
+		p.admit.Increment(1)
+	}
+	require.False(t, p.admit.warming())
+	// Give every resident key a measured frequency so random sampling always
+	// finds a victim with history above the unknown key's zero estimate.
+	for k := uint64(1); k <= 100; k++ {
+		p.evict.add(k, 1)
+		p.admit.Increment(k)
+		p.admit.Increment(k)
+	}
+	p.Unlock()
+	_, added = p.Add(6, 20)
 	require.False(t, added)
 }
 

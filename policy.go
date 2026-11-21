@@ -144,7 +144,18 @@ func (p *defaultPolicy[V]) Add(key uint64, cost int64) ([]*Item[V], bool) {
 		}
 
 		// If the incoming item isn't worth keeping in the policy, reject.
-		if incHits < minHits {
+		//
+		// Cold-start exception: while the frequency sketch is still warming
+		// up, access history only reaches it in delayed batches, so a genuinely
+		// hot key can legitimately estimate at zero simply because its accesses
+		// haven't been recorded yet. Rejecting it against a resident key whose
+		// estimate is mostly count-min noise keeps the first popular keys out
+		// and pins the cache to whatever filled it first. While warming, give a
+		// key with no recorded history the benefit of the doubt. A key that
+		// already has measured frequency is still judged by the strict
+		// comparison, and once the sketch is warm the exception is gone, so
+		// steady-state admission and hit ratio are unchanged.
+		if incHits < minHits && !(incHits == 0 && p.admit.warming()) {
 			p.metrics.add(rejectSets, key, 1)
 			return victims, false
 		}
@@ -333,6 +344,11 @@ type tinyLFU struct {
 	door    *z.Bloom
 	incrs   int64
 	resetAt int64
+	// warmed flips to true once the first aging cycle has run. Before that the
+	// sketch genuinely has no measured frequency window (cold start); after it
+	// flips, later reset() calls just start a fresh window of an already warm
+	// cache and must not re-enable the cold-start admission exception.
+	warmed bool
 }
 
 func newTinyLFU(numCounters int64) *tinyLFU {
@@ -357,6 +373,15 @@ func (p *tinyLFU) Estimate(key uint64) int64 {
 	return hits
 }
 
+// warming reports whether the sketch is in the cold-start phase: the first
+// frequency window is still being filled, so a zero Estimate mostly means
+// "not seen yet" rather than "genuinely low frequency". It stays true only
+// until the first aging cycle completes; subsequent windows belong to an
+// already warm cache.
+func (p *tinyLFU) warming() bool {
+	return !p.warmed
+}
+
 func (p *tinyLFU) Increment(key uint64) {
 	// Flip doorkeeper bit if not already done.
 	if added := p.door.AddIfNotHas(key); !added {
@@ -376,10 +401,14 @@ func (p *tinyLFU) reset() {
 	p.door.Clear()
 	// halves count-min counters
 	p.freq.Reset()
+	// The first completed aging cycle means the sketch has now observed a full
+	// window of real access frequencies, so cold start is over.
+	p.warmed = true
 }
 
 func (p *tinyLFU) clear() {
 	p.incrs = 0
 	p.door.Clear()
 	p.freq.Clear()
+	p.warmed = false
 }
