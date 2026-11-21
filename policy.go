@@ -181,6 +181,14 @@ func (p *defaultPolicy[V]) Del(key uint64) {
 	p.Unlock()
 }
 
+// Expire reclaims the cost of an item removed because its TTL elapsed. TTL
+// expiration is accounted separately from capacity eviction.
+func (p *defaultPolicy[V]) Expire(key uint64) int64 {
+	p.Lock()
+	defer p.Unlock()
+	return p.evict.expire(key)
+}
+
 func (p *defaultPolicy[V]) Cap() int64 {
 	p.Lock()
 	capacity := p.evict.getMaxCost() - p.evict.used
@@ -294,6 +302,18 @@ func (p *sampledLFU) del(key uint64) {
 	delete(p.keyCosts, key)
 	p.metrics.add(costEvict, key, uint64(cost))
 	p.metrics.add(keyEvict, key, 1)
+}
+
+func (p *sampledLFU) expire(key uint64) int64 {
+	cost, ok := p.keyCosts[key]
+	if !ok {
+		return -1
+	}
+	p.used -= cost
+	delete(p.keyCosts, key)
+	p.metrics.add(costExpired, key, uint64(cost))
+	p.metrics.add(keyExpired, key, 1)
+	return cost
 }
 
 func (p *sampledLFU) add(key uint64, cost int64) {

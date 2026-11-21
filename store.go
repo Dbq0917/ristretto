@@ -37,11 +37,18 @@ type store[V any] interface {
 	Set(*Item[V])
 	// Del deletes the key-value pair from the Map.
 	Del(uint64, uint64) (uint64, V)
+	// DelExpired deletes the key only if the stored entry still has the
+	// expiration observed by the cleanup path.
+	DelExpired(uint64, uint64, time.Time) (*Item[V], bool)
 	// Update attempts to update the key with a new value and returns true if
 	// successful.
 	Update(*Item[V]) (V, bool)
 	// Cleanup removes items that have an expired TTL.
 	Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V]))
+	// CleanupExpired removes entries whose expiration has elapsed without
+	// waiting for the periodic bucket sweep. It stops once targetFree capacity
+	// is available.
+	CleanupExpired(policy *defaultPolicy[V], onEvict func(item *Item[V]), targetFree int64)
 	// Clear clears all contents of the store.
 	Clear(onEvict func(item *Item[V]))
 	SetShouldUpdateFn(f updateFn[V])
@@ -127,12 +134,24 @@ func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V) {
 	return sm.shards[key%numShards].Del(key, conflict)
 }
 
+func (sm *shardedMap[V]) DelExpired(key, conflict uint64, expiration time.Time) (*Item[V], bool) {
+	return sm.shards[key%numShards].delExpired(key, conflict, expiration)
+}
+
 func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, bool) {
 	return sm.shards[newItem.Key%numShards].Update(newItem)
 }
 
 func (sm *shardedMap[V]) Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V])) {
 	sm.expiryMap.cleanup(sm, policy, onEvict)
+}
+
+func (sm *shardedMap[V]) CleanupExpired(
+	policy *defaultPolicy[V],
+	onEvict func(item *Item[V]),
+	targetFree int64,
+) {
+	sm.expiryMap.cleanupExpired(sm, policy, onEvict, time.Now(), targetFree)
 }
 
 func (sm *shardedMap[V]) Clear(onEvict func(item *Item[V])) {
@@ -233,11 +252,39 @@ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
 	}
 
 	if !item.expiration.IsZero() {
-		m.em.del(key, item.expiration)
+		m.em.del(key, item.conflict, item.expiration)
 	}
 
 	delete(m.data, key)
 	return item.conflict, item.value
+}
+
+// delExpired removes an entry only if it is still the exact expiration version
+// observed by the cleanup path. A concurrent refresh moves the key to a later
+// deadline, in which case the refreshed entry must survive.
+func (m *lockedMap[V]) delExpired(key, conflict uint64, expiration time.Time) (*Item[V], bool) {
+	m.Lock()
+	defer m.Unlock()
+
+	item, ok := m.data[key]
+	if !ok {
+		return nil, false
+	}
+	if conflict != item.conflict {
+		return nil, false
+	}
+	if item.expiration.IsZero() || !item.expiration.Equal(expiration) {
+		return nil, false
+	}
+
+	m.em.del(key, item.conflict, item.expiration)
+	delete(m.data, key)
+	return &Item[V]{
+		Key:        item.key,
+		Conflict:   item.conflict,
+		Value:      item.value,
+		Expiration: item.expiration,
+	}, true
 }
 
 func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {

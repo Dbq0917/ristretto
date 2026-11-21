@@ -554,6 +554,13 @@ func (c *Cache[K, V]) processItems() {
 
 			switch i.flag {
 			case itemNew:
+				// Expired entries still occupy policy capacity until they are
+				// swept. Before allowing the policy to evict a live key under
+				// pressure, reclaim any entries whose exact deadline has
+				// elapsed. This is queue-driven, not a cache-wide scan.
+				if c.cachePolicy.Cap() < i.Cost {
+					c.storedItems.CleanupExpired(c.cachePolicy, onEvict, i.Cost)
+				}
 				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
@@ -611,6 +618,10 @@ const (
 	// floor.
 	dropGets
 	keepGets
+	// The following 2 keep track of keys and cost reclaimed by TTL expiry.
+	// Expiration and capacity eviction are separate events.
+	keyExpired
+	costExpired
 	// This should be the final enum. Other enums should be set before this.
 	doNotUse
 )
@@ -639,6 +650,10 @@ func stringFor(t metricType) string {
 		return "gets-dropped"
 	case keepGets:
 		return "gets-kept"
+	case keyExpired:
+		return "keys-expired"
+	case costExpired:
+		return "cost-expired"
 	default:
 		return "unidentified"
 	}
@@ -714,6 +729,11 @@ func (p *Metrics) KeysEvicted() uint64 {
 	return p.get(keyEvict)
 }
 
+// KeysExpired is the total number of keys removed by TTL expiration.
+func (p *Metrics) KeysExpired() uint64 {
+	return p.get(keyExpired)
+}
+
 // CostAdded is the sum of costs that have been added (successful Set calls).
 func (p *Metrics) CostAdded() uint64 {
 	return p.get(costAdd)
@@ -722,6 +742,11 @@ func (p *Metrics) CostAdded() uint64 {
 // CostEvicted is the sum of all costs that have been evicted.
 func (p *Metrics) CostEvicted() uint64 {
 	return p.get(costEvict)
+}
+
+// CostExpired is the sum of all costs reclaimed by TTL expiration.
+func (p *Metrics) CostExpired() uint64 {
+	return p.get(costExpired)
 }
 
 // SetsDropped is the number of Set calls that don't make it into internal
