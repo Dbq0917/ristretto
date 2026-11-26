@@ -93,6 +93,22 @@ func main() {
 }
 ```
 
+### Prefix-based invalidation
+
+The cache only stores key hashes, never plaintext keys. To invalidate a whole group of related
+entries at once (for example every cached price of one product category), write them with a
+prefix and invalidate that prefix later. Only hashes are retained in the underlying index, and
+invalidating a prefix touches just that group's entries instead of scanning the whole cache:
+
+```go
+cache.SetWithPrefix("product:electronics", "product:electronics:42", "99.90", 1)
+cache.SetWithPrefix("product:grocery", "product:grocery:7", "3.50", 1)
+cache.Wait()
+
+// A price change for electronics invalidates only that category's entries.
+cache.InvalidatePrefix("product:electronics")
+```
+
 ## Benchmarks
 
 The benchmarks can be found in

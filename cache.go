@@ -41,6 +41,9 @@ type Key = z.Key
 type Cache[K Key, V any] struct {
 	// storedItems is the central concurrent hashmap where key-value items are stored.
 	storedItems store[V]
+	// prefixes maps prefix hashes to the key hashes written under them, so a
+	// whole group of entries can be invalidated without keeping plaintext keys.
+	prefixes *prefixIndex
 	// cachePolicy determines what gets let in to the cache and what gets kicked out.
 	cachePolicy *defaultPolicy[V]
 	// getBuf is a custom ring buffer implementation that gets pushed to when
@@ -198,6 +201,10 @@ type Item[V any] struct {
 	Value      V
 	Cost       int64
 	Expiration time.Time
+	// hasPrefix reports whether PrefixHash was supplied on the write that
+	// produced this item.
+	hasPrefix  bool
+	PrefixHash uint64
 	wait       chan struct{}
 }
 
@@ -222,6 +229,7 @@ func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
 	policy := newPolicy[V](config.NumCounters, config.MaxCost)
 	cache := &Cache[K, V]{
 		storedItems:        newStore[V](),
+		prefixes:           newPrefixIndex(),
 		cachePolicy:        policy,
 		getBuf:             newRingBuffer(policy, config.BufferItems),
 		setBuf:             make(chan *Item[V], setBufSize),
@@ -320,6 +328,29 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.set(key, value, cost, ttl, false, 0)
+}
+
+// SetWithPrefix works like Set but also associates the entry with prefix. The
+// plaintext prefix is never retained: only its hash is stored, in a separate
+// inverted index (see InvalidatePrefix). Every later call that writes the same
+// key with a prefix replaces its previous prefix association, while writes via
+// Set/SetWithTTL leave the existing association untouched.
+func (c *Cache[K, V]) SetWithPrefix(prefix string, key K, value V, cost int64) bool {
+	return c.SetWithPrefixAndTTL(prefix, key, value, cost, 0*time.Second)
+}
+
+// SetWithPrefixAndTTL works like SetWithPrefix but adds an expiration time,
+// see SetWithTTL for the TTL semantics.
+func (c *Cache[K, V]) SetWithPrefixAndTTL(
+	prefix string, key K, value V, cost int64, ttl time.Duration,
+) bool {
+	return c.set(key, value, cost, ttl, true, hashPrefix(prefix))
+}
+
+func (c *Cache[K, V]) set(
+	key K, value V, cost int64, ttl time.Duration, hasPrefix bool, prefixHash uint64,
+) bool {
 	if c == nil || c.isClosed.Load() {
 		return false
 	}
@@ -344,6 +375,8 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		hasPrefix:  hasPrefix,
+		PrefixHash: prefixHash,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -375,6 +408,7 @@ func (c *Cache[K, V]) Del(key K) {
 	keyHash, conflictHash := c.keyToHash(key)
 	// Delete immediately.
 	_, prev := c.storedItems.Del(keyHash, conflictHash)
+	c.prefixes.removeKey(keyHash)
 	c.onExit(prev)
 	// If we've set an item, it would be applied slightly later.
 	// So we must push the same item to `setBuf` with the deletion flag.
@@ -384,6 +418,30 @@ func (c *Cache[K, V]) Del(key K) {
 		flag:     itemDelete,
 		Key:      keyHash,
 		Conflict: conflictHash,
+	}
+}
+
+// InvalidatePrefix deletes every cache entry previously written with prefix.
+// Only entries whose writes carried that prefix are affected: entries under
+// other prefixes, and entries written without a prefix, stay cached.
+//
+// The prefix itself is hashed and never stored in plaintext, and the lookup is
+// driven by a hash-based inverted index, so invalidating a prefix touches only
+// its own entries rather than scanning the whole cache. A Set for one of the
+// affected keys that is still buffered when this runs is applied afterwards
+// and remains visible, matching the ordering guarantees of Del.
+func (c *Cache[K, V]) InvalidatePrefix(prefix string) {
+	if c == nil || c.isClosed.Load() {
+		return
+	}
+
+	keyHashes := c.prefixes.invalidate(hashPrefix(prefix))
+	for _, keyHash := range keyHashes {
+		// Passing conflict 0 deletes whatever entry currently occupies the key,
+		// mirroring how policy-driven evictions delete their victims.
+		_, prev := c.storedItems.Del(keyHash, 0)
+		c.cachePolicy.Del(keyHash)
+		c.onExit(prev)
 	}
 }
 
@@ -475,6 +533,7 @@ loop:
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
+	c.prefixes.clear()
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
@@ -531,6 +590,9 @@ func (c *Cache[K, V]) processItems() {
 			c.Metrics.trackEviction(int64(time.Since(ts) / time.Second))
 			delete(startTs, i.Key)
 		}
+		// Policy-driven evictions and TTL expirations both flow through here,
+		// so the prefix index stays in sync with the store on every removal.
+		c.prefixes.removeKey(i.Key)
 		if c.onEvict != nil {
 			c.onEvict(i)
 		}
@@ -557,9 +619,17 @@ func (c *Cache[K, V]) processItems() {
 				victims, added := c.cachePolicy.Add(i.Key, i.Cost)
 				if added {
 					c.storedItems.Set(i)
+					if i.hasPrefix {
+						c.prefixes.add(i.PrefixHash, i.Key)
+					}
 					c.Metrics.add(keyAdd, i.Key, 1)
 					trackAdmission(i.Key)
-				} else {
+				} else if i.hasPrefix {
+					// The item was never stored, so it must not leave a prefix
+					// association behind for a future invalidation to find.
+					c.prefixes.removeKey(i.Key)
+				}
+				if !added {
 					c.onReject(i)
 				}
 				for _, victim := range victims {
@@ -569,10 +639,14 @@ func (c *Cache[K, V]) processItems() {
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
+				if i.hasPrefix {
+					c.prefixes.add(i.PrefixHash, i.Key)
+				}
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.
 				_, val := c.storedItems.Del(i.Key, i.Conflict)
+				c.prefixes.removeKey(i.Key)
 				c.onExit(val)
 			}
 		case <-c.cleanupTicker.C:

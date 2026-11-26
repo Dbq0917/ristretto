@@ -7,6 +7,12 @@ adhere to [Semantic Versioning](http://semver.org/spec/v2.0.0.html) starting v1.
 
 ## [Unreleased]
 
+### Added
+
+- `Cache.SetWithPrefix`/`Cache.SetWithPrefixAndTTL` and `Cache.InvalidatePrefix`, which group
+  entries under a hash-only prefix index so a batch of keys can be invalidated together without
+  retaining plaintext keys or scanning the whole cache
+
 ## [v2.4.2] - 2026-07-07
 
 ### Fixed
