@@ -25,6 +25,26 @@ var (
 	setBufSize = 32 * 1024
 )
 
+// Sentinel errors returned by the error-returning write API. They let callers
+// tell a transiently saturated buffer apart from an invalid request so the two
+// failure modes can be handled differently (back off and retry vs. a hard
+// reject) instead of both collapsing into a plain false return.
+var (
+	// ErrSetBufferFull is returned when the write buffer is saturated and the
+	// item could not be enqueued for the background goroutine. The call did not
+	// block; the caller may retry later (for example via SetWithTTLWait) or give
+	// up. Every occurrence is counted and exposed through Cache.DroppedSets.
+	ErrSetBufferFull = errors.New("ristretto: set buffer is full, try again later")
+
+	// ErrInvalidTTL is returned when the supplied TTL is negative. A negative
+	// TTL is an invalid argument rather than back-pressure.
+	ErrInvalidTTL = errors.New("ristretto: ttl can't be negative")
+
+	// ErrCacheClosed is returned when a write is attempted against a cache that
+	// has been closed (or is nil).
+	ErrCacheClosed = errors.New("ristretto: cache is closed")
+)
+
 const itemSize = int64(unsafe.Sizeof(storeItem[any]{}))
 
 func zeroValue[T any]() T {
@@ -49,6 +69,10 @@ type Cache[K Key, V any] struct {
 	// setBuf is a buffer allowing us to batch/drop Sets during times of high
 	// contention.
 	setBuf chan *Item[V]
+	// droppedSets counts the writes rejected because setBuf was full. It is
+	// always maintained (independent of Config.Metrics) so saturation is
+	// observable even when statistics collection is disabled.
+	droppedSets atomic.Uint64
 	// onEvict is called for item evictions.
 	onEvict func(*Item[V])
 	// onReject is called when an item is rejected via admission policy.
@@ -313,6 +337,26 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 	return c.SetWithTTL(key, value, cost, 0*time.Second)
 }
 
+// SetE is the error-returning counterpart of Set. It never blocks: when the
+// write buffer is saturated it returns ErrSetBufferFull instead of waiting on
+// the background goroutine. Invalid arguments are reported with a distinct
+// error (ErrInvalidTTL for a negative TTL, ErrCacheClosed when the cache is
+// closed), letting callers distinguish "too busy, retry later" from "bad
+// request, reject".
+func (c *Cache[K, V]) SetE(key K, value V, cost int64) error {
+	return c.SetWithTTLE(key, value, cost, 0*time.Second)
+}
+
+// SetWait is the error-returning counterpart of Set that is willing to wait up
+// to waitTimeout for room in the write buffer. A waitTimeout <= 0 makes it
+// behave exactly like SetE (fully non-blocking). If the buffer stays full for
+// the whole window, ErrSetBufferFull is returned, so the write path never
+// blocks without a bound or inherits the background goroutine's latency
+// indefinitely.
+func (c *Cache[K, V]) SetWait(key K, value V, cost int64, waitTimeout time.Duration) error {
+	return c.SetWithTTLWait(key, value, cost, 0*time.Second, waitTimeout)
+}
+
 // SetWithTTL works like Set but adds a key-value pair to the cache that will expire
 // after the specified TTL (time to live) has passed. A zero value means the value never
 // expires, which is identical to calling Set. A negative value is a no-op and the value
@@ -320,8 +364,29 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.SetWithTTLE(key, value, cost, ttl) == nil
+}
+
+// SetWithTTLE is the error-returning counterpart of SetWithTTL. It is
+// non-blocking and returns a typed error (see SetE) rather than a bare boolean
+// so a saturated buffer can be told apart from an invalid request.
+func (c *Cache[K, V]) SetWithTTLE(key K, value V, cost int64, ttl time.Duration) error {
+	return c.setWithTTL(key, value, cost, ttl, 0)
+}
+
+// SetWithTTLWait is the bounded-wait counterpart of SetWithTTL. It waits up to
+// waitTimeout for space in the write buffer; see SetWait for waitTimeout's
+// meaning and the returned errors.
+func (c *Cache[K, V]) SetWithTTLWait(key K, value V, cost int64, ttl, waitTimeout time.Duration) error {
+	return c.setWithTTL(key, value, cost, ttl, waitTimeout)
+}
+
+// setWithTTL holds the shared write logic. waitTimeout <= 0 is fully
+// non-blocking; otherwise the call blocks at most waitTimeout before returning
+// ErrSetBufferFull.
+func (c *Cache[K, V]) setWithTTL(key K, value V, cost int64, ttl, waitTimeout time.Duration) error {
 	if c == nil || c.isClosed.Load() {
-		return false
+		return ErrCacheClosed
 	}
 
 	var expiration time.Time
@@ -331,7 +396,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		break
 	case ttl < 0:
 		// Treat this a no-op.
-		return false
+		return ErrInvalidTTL
 	default:
 		expiration = time.Now().Add(ttl)
 	}
@@ -351,20 +416,44 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		c.onExit(prev)
 		i.flag = itemUpdate
 	}
-	// Attempt to send item to cachePolicy.
+
+	// Attempt to enqueue the item for the background processItems goroutine.
+	// The non-blocking branch keeps the write path off the critical path of the
+	// background work; the bounded branch waits only as long as the caller
+	// explicitly allows.
+	if waitTimeout <= 0 {
+		select {
+		case c.setBuf <- i:
+			return nil
+		default:
+			return c.dropSet(i, keyHash)
+		}
+	}
+
+	timer := time.NewTimer(waitTimeout)
+	defer timer.Stop()
 	select {
 	case c.setBuf <- i:
-		return true
-	default:
-		if i.flag == itemUpdate {
-			// Return true if this was an update operation since we've already
-			// updated the storedItems. For all the other operations (set/delete), we
-			// return false which means the item was not inserted.
-			return true
-		}
-		c.Metrics.add(dropSets, keyHash, 1)
-		return false
+		return nil
+	case <-timer.C:
+		return c.dropSet(i, keyHash)
 	}
+}
+
+// dropSet records a saturated-buffer rejection and maps it to the
+// caller-facing result. Updates have already mutated storedItems, so they are
+// not reported as a failure even though the policy notification was not
+// enqueued.
+func (c *Cache[K, V]) dropSet(i *Item[V], keyHash uint64) error {
+	if i.flag == itemUpdate {
+		// The value is already updated in storedItems. For all other operations
+		// (set/delete), the item was not inserted.
+		return nil
+	}
+	c.droppedSets.Add(1)
+	// Keep the optional, sharded metric in sync when collection is enabled.
+	c.Metrics.add(dropSets, keyHash, 1)
+	return ErrSetBufferFull
 }
 
 // Del deletes the key-value item from the cache if it exists.
@@ -475,6 +564,8 @@ loop:
 	// Clear value hashmap and cachePolicy data.
 	c.cachePolicy.Clear()
 	c.storedItems.Clear(c.onEvict)
+	// Reset the always-on back-pressure counter.
+	c.droppedSets.Store(0)
 	// Only reset metrics if they're enabled.
 	if c.Metrics != nil {
 		c.Metrics.Clear()
@@ -505,6 +596,17 @@ func (c *Cache[K, V]) RemainingCost() int64 {
 		return 0
 	}
 	return c.cachePolicy.Cap()
+}
+
+// DroppedSets returns the number of writes rejected because the internal write
+// buffer was full (back-pressure). Unlike Metrics.SetsDropped, this counter is
+// always maintained even when Config.Metrics is false, so saturation stays
+// observable in production. It is reset by Clear.
+func (c *Cache[K, V]) DroppedSets() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.droppedSets.Load()
 }
 
 // processItems is ran by goroutines processing the Set buffer.

@@ -181,6 +181,31 @@ into the cache. The new item could be dropped at two points: when passing throug
 when passing through the admission policy. However, this doesn't affect hit ratios much at all as we
 expect the most popular items to be Set multiple times and eventually make it in the cache.
 
+### How do I tell a saturated buffer apart from an invalid Set?
+
+`Set`/`SetWithTTL` keep returning a plain `bool`, so a `false` cannot distinguish a full buffer from
+an invalid request. The error-returning API makes the two failure modes explicit without making the
+write path blocking:
+
+- `SetE`/`SetWithTTLE` are fully non-blocking. They return `ErrSetBufferFull` when the write buffer
+  is saturated (back-pressure: back off and retry), `ErrInvalidTTL` for a negative TTL, and
+  `ErrCacheClosed` when the cache is closed (hard errors: reject the request).
+- `SetWait`/`SetWithTTLWait` wait at most a `waitTimeout` for room in the buffer, then return
+  `ErrSetBufferFull`. A non-positive timeout behaves exactly like `SetE`. Because the wait is
+  bounded, caller latency is never coupled indefinitely to the background goroutine.
+- `DroppedSets()` reports the number of writes rejected due to a full buffer. It is always
+  maintained, even when `Config.Metrics` is false, and is reset by `Clear`.
+
+```go
+if err := cache.SetE("key", "value", 1); errors.Is(err, ristretto.ErrSetBufferFull) {
+    // Too busy: retry with a bounded wait, or shed the load.
+    _ = cache.SetWait("key", "value", 1, 10*time.Millisecond)
+} else if err != nil {
+    // Invalid request (bad TTL / closed cache): reject it.
+}
+_ = cache.DroppedSets() // observable back-pressure counter
+```
+
 ### Is Ristretto distributed?
 
 No, it's just like any other Go library that you can import into your project and use in a single
