@@ -93,6 +93,36 @@ func main() {
 }
 ```
 
+### Warming a cold cache
+
+Use `Warmup` when the application already knows which keys are hot at startup. It loads the values
+through the normal non-blocking write path, reports how many entries were admitted, rejected by the
+policy, or dropped by a full buffer, and waits until accepted entries are visible.
+
+```go
+keys := []string{"user:1", "user:2", "user:3"}
+result, err := cache.WarmupE(keys, func(key string) (string, int64, error) {
+  value, err := loadFromDatabase(key)
+  if err != nil {
+    return "", 0, err
+  }
+  return value, int64(len(value)), nil
+}, ristretto.WarmupOptions{
+  Concurrency:   4, // at most four database reads at once
+  RatePerSecond: 50, // and at most fifty starts per second overall
+})
+if err != nil {
+  // The result still contains the counts for keys that did load.
+  log.Printf("warmup completed with loader errors: %v", err)
+}
+
+fmt.Printf("loaded=%d rejected=%d dropped=%d\n",
+  result.Loaded, result.Rejected, result.Dropped)
+```
+
+Warmed entries go through the same TinyLFU admission and SampledLFU eviction as regular writes.
+Use `WarmupE` when the loader can return errors.
+
 ## Benchmarks
 
 The benchmarks can be found in

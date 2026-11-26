@@ -199,7 +199,16 @@ type Item[V any] struct {
 	Cost       int64
 	Expiration time.Time
 	wait       chan struct{}
+	warmup     *warmupItemState
 }
+
+type setResult uint8
+
+const (
+	setDropped setResult = iota
+	setQueued
+	setApplied
+)
 
 // NewCache returns a new Cache instance and any configuration errors, if any.
 func NewCache[K Key, V any](config *Config[K, V]) (*Cache[K, V], error) {
@@ -320,8 +329,14 @@ func (c *Cache[K, V]) Set(key K, value V, cost int64) bool {
 //
 // See Set for more information.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) bool {
+	return c.setWithTTL(key, value, cost, ttl, nil) != setDropped
+}
+
+func (c *Cache[K, V]) setWithTTL(
+	key K, value V, cost int64, ttl time.Duration, warmup *warmupItemState,
+) setResult {
 	if c == nil || c.isClosed.Load() {
-		return false
+		return setDropped
 	}
 
 	var expiration time.Time
@@ -331,7 +346,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		break
 	case ttl < 0:
 		// Treat this a no-op.
-		return false
+		return setDropped
 	default:
 		expiration = time.Now().Add(ttl)
 	}
@@ -344,6 +359,7 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Value:      value,
 		Cost:       cost,
 		Expiration: expiration,
+		warmup:     warmup,
 	}
 	// cost is eventually updated. The expiration must also be immediately updated
 	// to prevent items from being prematurely removed from the map.
@@ -354,16 +370,16 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 	// Attempt to send item to cachePolicy.
 	select {
 	case c.setBuf <- i:
-		return true
+		return setQueued
 	default:
 		if i.flag == itemUpdate {
 			// Return true if this was an update operation since we've already
 			// updated the storedItems. For all the other operations (set/delete), we
 			// return false which means the item was not inserted.
-			return true
+			return setApplied
 		}
 		c.Metrics.add(dropSets, keyHash, 1)
-		return false
+		return setDropped
 	}
 }
 
@@ -462,6 +478,7 @@ loop:
 				close(i.wait)
 				continue
 			}
+			i.warmup.complete(false)
 			if i.flag != itemUpdate {
 				// In itemUpdate, the value is already set in the storedItems.  So, no need to call
 				// onEvict here.
@@ -566,9 +583,11 @@ func (c *Cache[K, V]) processItems() {
 					victim.Conflict, victim.Value = c.storedItems.Del(victim.Key, 0)
 					onEvict(victim)
 				}
+				i.warmup.complete(added)
 
 			case itemUpdate:
 				c.cachePolicy.Update(i.Key, i.Cost)
+				i.warmup.complete(true)
 
 			case itemDelete:
 				c.cachePolicy.Del(i.Key) // Deals with metrics updates.

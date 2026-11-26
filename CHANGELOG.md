@@ -7,6 +7,11 @@ adhere to [Semantic Versioning](http://semver.org/spec/v2.0.0.html) starting v1.
 
 ## [Unreleased]
 
+### Added
+
+- Add `Cache.Warmup`/`Cache.WarmupE` for rate-limited startup preloading with accurate
+  admitted/rejected/dropped counts.
+
 ## [v2.4.2] - 2026-07-07
 
 ### Fixed
