@@ -176,10 +176,12 @@ consistency. Our hit ratio performance is mostly due to an excellent
 [admission policy](https://arxiv.org/abs/1512.00727) and SampledLFU eviction policy.
 
 As for "shortcuts," the only thing Ristretto does that could be construed as one is dropping some
-Set calls. That means a Set call for a new item (updates are guaranteed) isn't guaranteed to make it
-into the cache. The new item could be dropped at two points: when passing through the Set buffer or
-when passing through the admission policy. However, this doesn't affect hit ratios much at all as we
-expect the most popular items to be Set multiple times and eventually make it in the cache.
+Set calls. A Set call for a new item isn't guaranteed to make it into the cache. The new item could
+be dropped at two points: when passing through the Set buffer or when passing through the admission
+policy. Updates that cannot be queued immediately return false and leave the previous value,
+expiration, and cost accounting unchanged rather than applying only half of the update. However,
+dropping new items doesn't affect hit ratios much at all as we expect the most popular items to be
+Set multiple times and eventually make it in the cache.
 
 ### Is Ristretto distributed?
 

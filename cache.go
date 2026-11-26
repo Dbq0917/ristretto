@@ -295,10 +295,12 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 }
 
 // Set attempts to add the key-value item to the cache. If it returns false,
-// then the Set was dropped and the key-value item isn't added to the cache. If
-// it returns true, there's still a chance it could be dropped by the policy if
-// its determined that the key-value item isn't worth keeping, but otherwise the
-// item will be added and other items will be evicted in order to make room.
+// then the Set did not take effect. For a new key, the item was dropped before
+// it reached the cache. For an existing key, the previous value, expiration,
+// and cost accounting remain unchanged. If it returns true, there's still a
+// chance a new item could be dropped by the admission policy if it isn't worth
+// keeping, but otherwise the item will be added and other items will be evicted
+// in order to make room.
 //
 // To dynamically evaluate the items cost using the Config.Coster function, set
 // the cost parameter to 0 and Coster will be ran when needed in order to find
@@ -345,23 +347,37 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, cost int64, ttl time.Duration) 
 		Cost:       cost,
 		Expiration: expiration,
 	}
-	// cost is eventually updated. The expiration must also be immediately updated
-	// to prevent items from being prematurely removed from the map.
-	if prev, ok := c.storedItems.Update(i); ok {
-		c.onExit(prev)
+	// Updates are installed immediately so later Gets observe the new value
+	// without waiting for processItems. The commit hook attempts to reserve a
+	// setBuf slot while the store write lock is still held; if the buffer is
+	// full, the store update is rolled back instead of leaving the value and
+	// expiration map ahead of policy accounting. The send is non-blocking, so
+	// a slow policy worker cannot stall or serialize the write path.
+	committed := func() bool {
 		i.flag = itemUpdate
+		select {
+		case c.setBuf <- i:
+			return true
+		default:
+			return false
+		}
 	}
-	// Attempt to send item to cachePolicy.
+	prev, updateResult := c.storedItems.UpdateWithCommit(i, committed)
+	switch updateResult {
+	case storeUpdateCommitted:
+		c.onExit(prev)
+		return true
+	case storeUpdateAborted:
+		c.Metrics.add(dropSets, keyHash, 1)
+		return false
+	}
+
+	// The key is absent or the update was rejected. Preserve the legacy
+	// new-item buffering path, including ShouldUpdate rejection handling.
 	select {
 	case c.setBuf <- i:
 		return true
 	default:
-		if i.flag == itemUpdate {
-			// Return true if this was an update operation since we've already
-			// updated the storedItems. For all the other operations (set/delete), we
-			// return false which means the item was not inserted.
-			return true
-		}
 		c.Metrics.add(dropSets, keyHash, 1)
 		return false
 	}

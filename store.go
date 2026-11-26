@@ -40,6 +40,10 @@ type store[V any] interface {
 	// Update attempts to update the key with a new value and returns true if
 	// successful.
 	Update(*Item[V]) (V, bool)
+	// UpdateWithCommit atomically updates the entry and invokes commit while
+	// still holding the entry's write lock. If commit returns false, the entry
+	// and its expiration metadata are restored to their previous state.
+	UpdateWithCommit(*Item[V], func() bool) (V, storeUpdateResult)
 	// Cleanup removes items that have an expired TTL.
 	Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V]))
 	// Clear clears all contents of the store.
@@ -50,6 +54,15 @@ type store[V any] interface {
 	// The set of values visited by IterValues is non-deterministic.
 	IterValues(cb func(v V) (stop bool))
 }
+
+type storeUpdateResult uint8
+
+const (
+	storeUpdateNotFound storeUpdateResult = iota
+	storeUpdateRejected
+	storeUpdateCommitted
+	storeUpdateAborted
+)
 
 // newStore returns the default store implementation.
 func newStore[V any]() store[V] {
@@ -129,6 +142,12 @@ func (sm *shardedMap[V]) Del(key, conflict uint64) (uint64, V) {
 
 func (sm *shardedMap[V]) Update(newItem *Item[V]) (V, bool) {
 	return sm.shards[newItem.Key%numShards].Update(newItem)
+}
+
+func (sm *shardedMap[V]) UpdateWithCommit(
+	newItem *Item[V], commit func() bool,
+) (V, storeUpdateResult) {
+	return sm.shards[newItem.Key%numShards].UpdateWithCommit(newItem, commit)
 }
 
 func (sm *shardedMap[V]) Cleanup(policy *defaultPolicy[V], onEvict func(item *Item[V])) {
@@ -241,19 +260,28 @@ func (m *lockedMap[V]) Del(key, conflict uint64) (uint64, V) {
 }
 
 func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
+	previous, result := m.UpdateWithCommit(newItem, func() bool { return true })
+	return previous, result == storeUpdateCommitted
+}
+
+func (m *lockedMap[V]) UpdateWithCommit(
+	newItem *Item[V], commit func() bool,
+) (V, storeUpdateResult) {
 	m.Lock()
 	defer m.Unlock()
+
 	item, ok := m.data[newItem.Key]
 	if !ok {
-		return zeroValue[V](), false
+		return zeroValue[V](), storeUpdateNotFound
 	}
 	if newItem.Conflict != 0 && (newItem.Conflict != item.conflict) {
-		return zeroValue[V](), false
+		return zeroValue[V](), storeUpdateRejected
 	}
 	if m.shouldUpdate != nil && !m.shouldUpdate(newItem.Value, item.value) {
-		return item.value, false
+		return item.value, storeUpdateRejected
 	}
 
+	previous := item
 	m.em.update(newItem.Key, newItem.Conflict, item.expiration, newItem.Expiration)
 	m.data[newItem.Key] = storeItem[V]{
 		key:        newItem.Key,
@@ -262,7 +290,13 @@ func (m *lockedMap[V]) Update(newItem *Item[V]) (V, bool) {
 		expiration: newItem.Expiration,
 	}
 
-	return item.value, true
+	if commit != nil && commit() {
+		return previous.value, storeUpdateCommitted
+	}
+
+	m.data[newItem.Key] = previous
+	m.em.update(newItem.Key, previous.conflict, newItem.Expiration, previous.expiration)
+	return previous.value, storeUpdateAborted
 }
 
 func (m *lockedMap[V]) Clear(onEvict func(item *Item[V])) {
